@@ -56,7 +56,17 @@ E1 = (I – f (Ur))T (I – f (Ur)) + (r – rtd)T (r – rtd)
 **How it connects to the project:**
 Theoretical background for Predictive Coding models.
 
+
 ## [Paper Title] — [Author(s), Year]
+
+**Date read:**
+
+**Link / DOI:**
+
+**Core idea in 2-3 sentences:**
+
+
+## An Approximation of the Error Backpropagation Algorithm in a Predictive Coding Network with Local Hebbian Synaptic Plasticity — [Whittington, 2017]
 
 **Date read:**
 
