@@ -21,6 +21,8 @@ This two-tier design also instantiates a broader principle from LeCun (2022): in
 
     Analogy. JEPA is like a translator who turns a noisy foreign broadcast into clean written sentences. PC is like a careful reader who, given those sentences, re-reads and revises their understanding until it is internally consistent — and can point to the words they're unsure about. Previously the reader had to work directly from the static-filled audio. Now they work from the clean transcript.
 
+A note on what is strictly necessary: PC is the load-bearing component for every primary goal — it is the source of iterative inference, precision-weighted uncertainty, and local Hebbian updates. JEPA is a quality multiplier: it gives PC a cleaner, lower-variance input space, making the inference loop converge faster and the precision maps semantically interpretable rather than pixel-level noise. In principle, all three evaluations could be run with PC operating on raw image patches and yield valid results. The composite is the stronger contribution because it adds the token-space vs. pixel-space comparison and makes precision maps meaningful at the level of semantic content — but if Stage 2 fails or is deprioritised, PC on raw CIFAR patches is an explicit fallback, not a defeat.
+
 ---
 
 ## Background: the two halves, explained simply
