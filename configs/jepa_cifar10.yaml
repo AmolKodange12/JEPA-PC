@@ -1,0 +1,16 @@
+dataset: cifar10
+
+model:
+  img_size: 32
+  patch_size: 4
+  in_channels: 3
+  embed_dim: 128
+  depth: 4
+  num_heads: 4
+  ema_momentum: 0.996
+
+training:
+  lr: 3.0e-4
+  epochs: 100
+  batch_size: 256
+  warmup_epochs: 10

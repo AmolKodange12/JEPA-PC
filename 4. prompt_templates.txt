@@ -1,0 +1,428 @@
+4. Per-Stage Prompt Templates
+INSTRUCTIONS
+
+What it is: a structured prompt template for each stage that bundles the relevant slices of documents 1–3 with the specific task.
+Why it prevents failures: AI-generated code quality degrades sharply when context is vague. "Write a PC layer" produces generic code. "Write a PC layer satisfying this interface contract, operating on tensors of this shape, in this environment, following this update equation" produces code that works on the first integration attempt.
+Template structure:
+ENVIRONMENT
+-----------
+[paste relevant slice of doc 1]
+
+INTERFACE CONTRACT
+------------------
+[paste the contract for the class being written from doc 2]
+
+DATA FLOW CONTEXT
+-----------------
+[paste the relevant slice of doc 3 showing what feeds into and out of this class]
+
+UPDATE EQUATION
+---------------
+[paste the exact mathematical update from §5.5 of the README]
+
+TASK
+----
+Implement [ClassName] in [file path] satisfying the above contract.
+Requirements:
+  - No gradients flow through W during inference_step
+  - precision is already normalised when passed in; do not renormalise
+  - return shapes must exactly match the contract
+  - include a __repr__ that prints input/output shapes for debugging
+
+DO NOT:
+  - add any functionality not specified above
+  - use any library not listed in the environment
+  - flatten the spatial dimensions
+  
+  
+
+Stage 1 — Vanilla PC on MNIST
+
+models/pc_layer.py
+text
+
+ENVIRONMENT
+-----------
+Stage 1 from README §7: MNIST, CPU, 10–20 min.  
+Python 3.10+, PyTorch 2.0+, torchvision, numpy, matplotlib.
+
+INTERFACE CONTRACT
+------------------
+[FROM INTERFACE CONTRACT DOC §3 — PCLayer]
+
+Class: PCLayer
+__init__(self, in_features: int, out_features: int)
+forward(self, x: Tensor) -> Tensor
+  x: (B, in_features) float32
+  returns: (B, out_features) float32  (initial representation r_init)
+
+inference_step(self, r_below: Tensor, r: Tensor, e_above: Tensor, lr_infer: float) -> Tensor
+  r_below: (B, in_features) float32
+  r:       (B, out_features) float32
+  e_above: (B, out_features) float32   (zero tensor at top level)
+  lr_infer: float
+  returns: (B, out_features) float32   updated r
+
+update_weights(self, e: Tensor, r: Tensor, lr_weights: float) -> None
+  e: (B, in_features) float32  final prediction error
+  r: (B, out_features) float32 final representation
+  lr_weights: float
+  Updates self.W in-place (no gradients).
+
+Invariants:
+  - self.W shape (in_features, out_features), initialised as randn * 0.01.
+  - No gradients on self.W during inference_step.
+  - e_above is exactly self.W_next.T @ e_next, already projected by the caller.
+  - precision weighting not used in this stage (uniform).
+  - forward() must compute r_init = f(x) and may use a learned projection (e.g., x @ W_bottom_up) but that W_bottom_up is separate from self.W.
+
+DATA FLOW CONTEXT
+-----------------
+The MNIST PC hierarchy is:
+  x = mnist_image.view(B, 784)                 # (B, 784) float32
+  r1 = pc1.forward(x)                          # (B, 256)
+  e1 = x - pc1.W @ r1                          # (B, 784)  (top-down prediction of x)
+  r2 = pc2.forward(r1)                         # (B, 64)
+  e2 = r1 - pc2.W @ r2                         # (B, 256)
+  r3 = pc3.forward(r2)                         # (B, 10)
+  e3 = r2 - pc3.W @ r3                         # (B, 64)
+
+Inference update (one step, η = lr_infer):
+  # e_above for pc1 is pc2.W.T @ e2  (already computed by the hierarchy loop)
+  r1 = pc1.inference_step(x,      r1, pc2.W.T @ e2, lr_infer)
+  r2 = pc2.inference_step(r1,     r2, pc3.W.T @ e3, lr_infer)
+  r3 = pc3.inference_step(r2,     r3, zeros(10),    lr_infer)   # top level
+
+After convergence (fixed number of steps T):
+  pc1.update_weights(e1, r1, lr_weights)
+  pc2.update_weights(e2, r2, lr_weights)
+  pc3.update_weights(e3, r3, lr_weights)
+
+UPDATE EQUATION
+---------------
+From README §5.5:
+  r_i  ←  r_i  +  η · ( e_i  −  W_{i+1}ᵀ · e_{i+1} )
+where e_i = r_{i-1} − W_i @ r_i   (prediction error from layer below)
+      e_{i+1} is the error from the layer above, back-projected.
+
+In inference_step, this means:
+  1. prediction = self.W @ r
+  2. e = r_below - prediction
+  3. delta_r = lr_infer * (e - self.W.T @ e_above)   # e_above already projected
+  4. return r + delta_r
+
+TASK
+----
+Implement class PCLayer in models/pc_layer.py satisfying the above contract exactly.
+
+Requirements:
+  - No gradients flow through self.W during inference_step (use torch.no_grad() or detach).
+  - e_above is passed as a tensor of shape (B, out_features); do not compute W.T @ e_above inside inference_step — it is already projected by the caller.
+  - forward() must set the initial r; simplest valid: r_init = x @ W_init, where W_init is a Parameter of shape (in_features, out_features), *separate from self.W*.
+  - __repr__ must print in_features, out_features.
+  - All dtypes float32.
+  - Device-agnostic (use the device of input tensors).
+
+DO NOT:
+  - Add any functionality not specified (no batch norm, activation functions, logging, extra regularisation).
+  - Use any library not listed in the environment.
+  - Flatten or reshape spatial dimensions (this stage is already flat).
+  - Allow gradient flow through self.W during inference_step.
+  - Modify r_below or e_above in-place.
+
+Stage 2 — JEPA Tokenizer on CIFAR‑10
+
+models/jepa_tokenizer.py + utils/ema.py
+text
+
+ENVIRONMENT
+-----------
+Stage 2 from README §7: CIFAR‑10, 4 GB GPU (e.g. Colab T4), 2–3 hours.  
+Must use torch.cuda.amp.autocast for memory. Batch size 32–64, gradient accumulation.  
+Python 3.10+, PyTorch 2.0+, torchvision, numpy, tqdm.
+
+INTERFACE CONTRACT
+------------------
+[FROM INTERFACE CONTRACT DOC §2 — JEPATokenizer and jepa_loss]
+
+Class: JEPATokenizer
+__init__(self, image_size=32, patch_size=4, dim=128, depth=4, heads=4, mlp_dim=256, predictor_depth=2, momentum=0.996)
+
+encode(self, x: Tensor) -> Tensor
+  x: (B, 3, 32, 32) float32  (normalised)
+  returns: (B, 8, 8, 128) float32   2D token grid PRESERVED
+
+encode_target(self, x: Tensor) -> Tensor
+  x: (B, 3, 32, 32) float32
+  returns: (B, 8, 8, 128) float32   detached, no grad
+
+forward(self, x: Tensor, mask: Tensor) -> Tensor   (training only)
+  x: (B, 3, 32, 32) float32
+  mask: (B, 64) bool  (True = masked token positions)
+  returns: (B, M, 128) float32  where M = mask.sum(dim=1) (varies per sample)
+
+Function: jepa_loss(predicted: Tensor, target: Tensor) -> Tensor
+  predicted: (B, M, 128) float32
+  target:    (B, M, 128) float32 (detached)
+  returns: scalar () float32 = 1 - mean(cosine_similarity)
+
+Function: update_target_encoder(online_encoder, target_encoder, momentum=0.996) -> None
+  Updates target_encoder parameters with EMA; target_encoder must have requires_grad=False permanently.
+
+Invariants:
+  - Context encoder (ViT) must apply 2D positional embeddings to the patch grid.
+  - encode() is NOT used during training; only forward() with masking.
+  - encode_target() runs under torch.no_grad() and returns a detached tensor.
+  - When frozen, all parameters of context encoder have requires_grad=False.
+  - The token grid output of encode() is (B,8,8,128), not flattened.
+
+DATA FLOW CONTEXT
+-----------------
+Training step (simplified, inside autocast):
+  x, mask = next(batch)                              # x: (B,3,32,32), mask: (B,64)
+  # online encoder + predictor
+  predicted_tokens = jepa.forward(x, mask)            # (B, M, 128)
+  with torch.no_grad():
+      target_tokens = jepa.encode_target(x)           # (B, 8,8,128) detached
+      # gather targets at masked positions
+      target_masked = target_tokens.reshape(B,64,128)[mask]  # (B, M, 128)
+  loss = jepa_loss(predicted_tokens, target_masked)
+  loss.backward()
+  optimizer.step()
+  update_target_encoder(jepa.context_encoder, jepa.target_encoder, momentum=0.996)
+
+Token extraction for PC (after training, frozen):
+  grid = jepa.encode(image)                           # (B,8,8,128)
+
+UPDATE EQUATION
+---------------
+Not directly applicable for JEPA training — but the loss is cosine similarity.
+
+TASK
+----
+Implement JEPATokenizer in models/jepa_tokenizer.py, update_target_encoder in utils/ema.py, and jepa_loss in models/jepa_tokenizer.py (or as a separate function) exactly satisfying the contracts.
+
+Requirements:
+  - JEPATokenizer must contain:
+      * self.patch_embed: Conv2d(3, dim, kernel_size=patch_size, stride=patch_size) producing (B, dim, 8, 8) then reshape to (B, 64, dim).
+      * self.pos_embed: learnable Parameter (1, 64, dim).
+      * self.context_encoder: a small ViT (nn.TransformerEncoder) with depth layers, dim, heads, mlp_dim. Must accept (B, seq_len, dim) and output (B, seq_len, dim). Include a class token? Not needed for dense prediction — keep sequence length 64.
+      * self.target_encoder: identical architecture, EMA-updated, never receives grad.
+      * self.predictor: a small MLP with predictor_depth layers mapping dim → mlp_dim → dim (or hidden_dim=256). Takes context tokens + mask token positions and predicts the masked tokens.
+  - encode(): patch embed + pos embed + context encoder; reshape output (B,64,128) → (B,8,8,128) and return.
+  - encode_target(): same as encode but with target_encoder and under torch.no_grad().
+  - forward(): mask out context tokens (set to zero or use a mask token), then context encoder, then predictor on mask positions.
+  - __repr__ on JEPATokenizer showing dim, depth, patch_size.
+  - All dtypes float32. Use torch.cuda.amp compatible operations.
+  - Include gradient accumulation support (expose via training loop, not inside module).
+
+DO NOT:
+  - Use any pretrained ViT from torchvision — build the ViT from scratch as per contract.
+  - Flatten the spatial grid prematurely: encode() output must be (B,8,8,128).
+  - Allow gradients to flow into target_encoder ever.
+  - Use batch sizes > 64 or ignore autocast — memory is 4 GB.
+  - Add any non‑specified regularisation, data augmentation, or logging inside the model class.
+
+Stage 3 — Convolutional PC over Frozen Tokens
+
+models/pc_conv.py
+text
+
+ENVIRONMENT
+-----------
+Stage 3 from README §7: CIFAR‑10, frozen JEPA tokenizer, 4 GB GPU, 1–2 hours.  
+PC layers are lightweight; tokenizer runs once per batch.  
+Python 3.10+, PyTorch 2.0+, torchvision, the Stage‑2 JEPATokenizer.
+
+INTERFACE CONTRACT
+------------------
+[FROM INTERFACE CONTRACT DOC §4 — ConvPCLayer]
+
+Class: ConvPCLayer
+__init__(self, in_channels: int, out_channels: int, kernel_size: int, stride=1, padding='same')
+  (padding default: kernel_size//2 to preserve spatial size)
+
+forward(self, x: Tensor) -> Tensor
+  x: (B, H, W, in_channels) float32  (e.g., (B,8,8,128) from JEPA)
+  returns: (B, H, W, out_channels) float32  initial representation r
+
+inference_step(self, r: Tensor, r_above: Tensor, e_below: Tensor, e_above: Tensor, precision: Tensor) -> Tensor
+  r:         (B, H, W, out_channels) float32
+  r_above:   (B, H', W', out_channels_above) — not used here? The contract says r_above is used for top-down prediction but in current design, e_below already contains the error. To keep it concrete, the implementation may ignore r_above and rely on e_below/e_above.
+  e_below:   (B, H, W, out_channels) float32   error from level below
+  e_above:   (B, H, W, out_channels) float32   error from level above, already projected to same shape
+  precision: (B, H, W, out_channels) float32   normalised within level before call
+  returns:   (B, H, W, out_channels) float32   updated r
+
+update_weights(self, e: Tensor, r: Tensor, lr_weights: float) -> None
+  e: (B, H, W, out_channels) float32
+  r: (B, H, W, out_channels) float32
+  Updates the convolution kernel(s) via local Hebbian rule.
+
+Invariants:
+  - self.W (the convolution kernel) shape (out_channels, in_channels, k, k). Must NOT require gradients during inference_step.
+  - precision is already normalised (e.g., divided by sum over spatial positions) — do not renormalise.
+  - The spatial layout H,W is preserved.
+  - forward() initialises r using a simple convolution: conv(x, W_init) where W_init is a separate weight from self.W.
+
+DATA FLOW CONTEXT
+-----------------
+Slice of full pipeline (Stage 3):
+  grid = jepa.encode(x)                      # (B,8,8,128)
+  r1 = conv_pc_1.forward(grid)               # (B,8,8,256)   in_ch=128, out_ch=256
+  e1 = grid - conv1_W(r1)                    # (B,8,8,128)   prediction of grid
+
+  r1_pooled = avg_pool2x2(r1)                # (B,4,4,256)
+  r2 = conv_pc_2.forward(r1_pooled)          # (B,4,4,512)   in_ch=256, out_ch=512
+  e2 = r1_pooled - conv2_W(r2)               # (B,4,4,256)
+
+  r2_pooled = avg_pool2x2(r2)                # (B,2,2,512)
+  r2_flat = r2_pooled.reshape(B, -1)         # (B,2048)
+  r3 = fc_pc_3.forward(r2_flat)             # (B,10)
+  e3 = r2_pooled - fc_W(r3).reshape(...)    # (B,2,2,512) error
+
+Inference update (ConvPCLayer level1):
+  # e_above from level2 must be upsampled and projected to match r1's shape:
+  # Up(e2) → (8,8,256), then a transposed conv W2.T mapping 256→256 (same out_channels). 
+  e2_up = upsample(e2)                      # (B,8,8,256)
+  e_above_proj = conv_transpose_W2(e2_up)   # (B,8,8,256) (matches r1 channels)
+  r1 = conv_pc_1.inference_step(r1, None, e1, e_above_proj, precision1)
+
+UPDATE EQUATION
+---------------
+From README §5.5:
+  r_i  ←  r_i  +  η · ( e_i  −  W_{i+1}ᵀ · e_{i+1} )
+For ConvPCLayer, the back‑projection W_{i+1}ᵀ · e_{i+1} is provided by the caller as e_above (already computed). So inference_step simply does:
+  r_new = r + lr * (precision * e_below - precision * e_above)
+
+TASK
+----
+Implement ConvPCLayer in models/pc_conv.py satisfying the above contract.
+
+Requirements:
+  - Store a convolution kernel `self.W` (the top‑down prediction weight) as a Parameter, but ensure it never gets gradients during inference_step (use torch.no_grad() context inside the method).
+  - Include a separate initial projection weight `self.W_init` (Conv2d(in_ch, out_ch, k, padding=k//2)) used only in forward().
+  - inference_step must NOT use self.W directly; it only needs the passed errors. The equation is r_new = r + lr_infer * (precision * e_below - precision * e_above). No convolutions inside inference_step — the caller already computed e_below and e_above in the correct shapes.
+  - update_weights performs a local Hebbian update: dW = conv2d(r, e) aggregated over batch, then self.W.data += lr_weights * dW. Use torch.nn.functional.conv2d with appropriate padding and no gradient tracking.
+  - __repr__ must show in_channels, out_channels, kernel_size.
+  - All tensors float32, device consistent.
+
+DO NOT:
+  - Perform any convolution inside inference_step — it must be a simple element‑wise update using provided errors.
+  - Renormalise precision — it arrives normalised.
+  - Flatten spatial dimensions anywhere inside the layer.
+  - Let self.W accumulate gradients during inference (detach or no_grad).
+  - Add batch norm, dropout, or any regularisation not specified.
+
+Stage 4 — Full Composite Assembly and Evaluation
+
+models/composite.py + experiments/evaluation.py
+text
+
+ENVIRONMENT
+-----------
+Stage 4 from README §7: CIFAR‑10/CIFAR‑100, frozen JEPA tokenizer, 4 GB GPU.  
+Composite model runs inference and optionally Hebbian training.  
+Python 3.10+, PyTorch 2.0+, torchvision, numpy, matplotlib, sklearn (for linear probe).
+
+INTERFACE CONTRACT
+------------------
+[FROM INTERFACE CONTRACT DOC §5 and §6 — JEPAPCComposite and evaluation functions]
+
+Class: JEPAPCComposite
+__init__(self, jepa_tokenizer, pc_levels: List, pool_sizes=[2,2], infer_steps=20, infer_lr=0.1, precision_normalize=True)
+  jepa_tokenizer: frozen JEPATokenizer with encode() → (B,8,8,128)
+  pc_levels: list of [ConvPCLayer, ConvPCLayer (or PCLayer), PCLayer]
+  pool_sizes: list of spatial downsampling factors between levels (e.g., [2,2])
+  infer_steps: default number of inference iterations
+  infer_lr: inference learning rate
+  precision_normalize: whether to normalise precision within each level before inference_step
+
+Methods:
+  extract_tokens(self, image: Tensor) -> Tensor
+    image: (B,3,32,32) float32  →  returns (B,8,8,128) float32, detached.
+
+  inference(self, image: Tensor, n_steps=None) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]
+    image: (B,3,32,32) float32
+    n_steps: optional int override
+    returns: r_list, e_list, prec_list
+      r_level1: (B,8,8,C1), r_level2: (B,4,4,C2), r_level3: (B,C3)
+      e_level1: (B,8,8,C1?), actually errors are at the lower level. Let's use the contract:
+      errors: e1 (8,8,128), e2 (4,4,256), e3 (2,2,512) as per data flow.
+    prec_list: same shapes as errors, normalised if flag true.
+
+  train_step(self, image, label, optimizer) -> float  (for continual learning)
+    Returns scalar loss.
+
+Evaluation functions:
+  evaluate_inference_adaptation(model, images, occlusion_fn, n_steps=20) -> dict
+  goal_directed_inference(model, tokens, uncertainty_threshold, max_steps) -> (r_list, prec_list, steps)
+
+DATA FLOW CONTEXT
+-----------------
+Full trace (already in Data Flow Diagram):
+  grid = jepa.encode(image)                            # (B,8,8,128)
+  r1 = conv_pc_1.forward(grid)                         # (B,8,8,256)
+  e1 = grid - conv1_pred(r1)                           # (B,8,8,128)
+  r1_pool = pool(r1)                                   # (B,4,4,256)
+  r2 = conv_pc_2.forward(r1_pool)                      # (B,4,4,512)
+  e2 = r1_pool - conv2_pred(r2)                        # (B,4,4,256)
+  r2_pool = pool(r2)                                   # (B,2,2,512)
+  r2_flat = flatten(r2_pool)                           # (B,2048)
+  r3 = fc_pc_3.forward(r2_flat)                        # (B,10)
+  e3 = r2_pool - fc_pred(r3).view(B,2,2,512)           # (B,2,2,512)
+
+  Inference loop (T steps):
+    for t in range(T):
+        # compute precision per level (or from cached variances)
+        p1 = normalise(1/e1.var(dim=...))              # (B,8,8,128) or (B,8,8,256)? Need consistent shapes. For simplicity, use e's channel as precision shape.
+        p2 = normalise(1/e2.var(...))                  # (B,4,4,256)
+        p3 = normalise(1/e3.var(...))                  # (B,2,2,512)
+        # e_above projections
+        e2_up = upsample(e2) to (8,8,256); e_above1 = conv_transpose_2(e2_up) to (8,8,256)
+        e3_up = upsample(e3) to (4,4,512); e_above2 = fc_transpose(e3) or conv_transpose_3(e3_up) to (4,4,512)
+        r1 = conv_pc_1.inference_step(r1, None, e1, e_above1, p1)
+        r2 = conv_pc_2.inference_step(r2, None, e2, e_above2, p2)
+        r3 = fc_pc_3.inference_step(r2_flat, r3, zeros(10))   # top level no e_above
+        # recompute errors
+        e1 = grid - conv1_pred(r1)
+        e2 = r1_pool - conv2_pred(r2)
+        e3 = r2_pool - fc_pred(r3).view(B,2,2,512)
+
+UPDATE EQUATION
+---------------
+Same as README §5.5; already captured in module contracts.
+
+TASK
+----
+Implement JEPAPCComposite in models/composite.py and the two evaluation functions in experiments/evaluation.py exactly satisfying the contracts.
+
+For JEPAPCComposite:
+  - Store JEPA tokenizer (frozen, no grad).
+  - Store pc_levels list.
+  - Implement `_predict_down(level, r)` for each level: conv for levels 1&2, fc for level3.
+  - Implement `_upsample_error` and `_project_above` to prepare e_above for each level. Must ensure shapes match the contracts (e.g., conv_transpose to match channels, and spatial upsampling when moving up).
+  - `inference()` orchestrates the loop: extract tokens, initialise r and e, then for t in range(n_steps) do the updates as in DATA FLOW, normalise precision if flag true.
+  - `train_step()` runs inference to convergence, then calls `update_weights` on each PC layer using the final errors and representations. Then optionally train a classification head with backprop (if included). Return total loss.
+  - Must handle both evaluation (no weight updates) and training (with weight updates after convergence).
+  - All dtypes float32. Use torch.no_grad() during the inference loop.
+
+For evaluation functions:
+  - `evaluate_inference_adaptation`: apply occlusion function to images, run `model.inference()` with varying steps, train a linear probe on the final representation of a chosen level (e.g., r3), return accuracy dict.
+  - `goal_directed_inference`: given tokens, run inference loop manually, compute mean uncertainty as (1/precision).mean(), break if below threshold. Return final r_list, prec_list, steps_taken.
+
+Requirements:
+  - No gradient flows to JEPA or PC weights during inference.
+  - Precision normalisation must be within-level (e.g., divide by sum over spatial positions of precision tensor for that error).
+  - The __repr__ of JEPAPCComposite must show the architecture shapes (token grid dims, PC level shapes).
+  - Include the simple linear probe inside the evaluation function (using sklearn or a torch Linear layer trained with LBFGS/Adam on frozen features).
+
+DO NOT:
+  - Fine‑tune the JEPA tokenizer during PC training or inference.
+  - Renormalise precision inside ConvPCLayer or PCLayer — it is done once in the composite.
+  - Use any non‑local weight updates; PC weights must use local Hebbian (or no‑grad) as specified.
+  - Add extra logging, TensorBoard, or checkpointing inside the core modules.
+  - Flatten or discard the 2D token grid at any point.
+  - Implement any goal‑directed logic inside the model itself; that belongs in the evaluation harness.
+
+These four templates are the exact prompts to use when generating each stage’s code. They capture every shape, every invariant, and every “do not” necessary to avoid the most common integration failures.

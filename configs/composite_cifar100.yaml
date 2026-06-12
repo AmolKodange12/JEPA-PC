@@ -1,0 +1,19 @@
+dataset: cifar100
+
+tokenizer:
+  checkpoint: null  # path to frozen JEPA tokenizer checkpoint
+  embed_dim: 128
+
+pc_network:
+  layer_dims: [128, 256, 64]
+  lr_inference: 0.01
+
+training:
+  lr_weights: 0.001
+  n_inference_steps: 20
+  epochs: 50
+  batch_size: 128
+
+continual_learning:
+  n_tasks: 10
+  classes_per_task: 10

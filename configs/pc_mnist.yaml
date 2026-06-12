@@ -1,0 +1,11 @@
+dataset: mnist
+
+model:
+  layer_dims: [784, 256, 64, 10]
+  lr_inference: 0.01
+
+training:
+  lr_weights: 0.001
+  n_inference_steps: 20
+  epochs: 10
+  batch_size: 64

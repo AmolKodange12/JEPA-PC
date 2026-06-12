@@ -1,0 +1,154 @@
+3. Data Flow Diagram (annotated with shapes)
+INSTRUCTIONS:
+
+What it is: a trace of a single forward + inference pass through the entire system, annotated with exact tensor shapes at every step.
+
+Why it prevents failures: AI models generate locally coherent code that is globally incoherent. Each module looks correct in isolation; the shapes break at the seams. An explicit shape trace makes every seam visible before code is written.
+
+Format: literal pseudocode with shapes as comments, tracing one batch through the full system:
+
+python
+# Input
+x = images                          # (B, 3, 32, 32)
+
+# JEPA tokenizer
+patches = patch_embed(x)            # (B, 64, 128)   — 64 tokens, dim 128
+tokens  = context_encoder(patches)  # (B, 64, 128)   — ViT output, same shape
+grid    = tokens.reshape(B, 8, 8, 128)  # (B, 8, 8, 128) — 2D layout restored HERE
+
+# PC Level 1 — convolutional over token grid
+r1 = conv_pc_1(grid)               # (B, 8, 8, 256)  — out_channels=256
+e1 = grid - predict_down_1(r1)     # (B, 8, 8, 128)  — error at token level
+
+# Spatial pooling Level 1 → Level 2
+r1_pooled = pool(r1)               # (B, 4, 4, 256)
+
+# PC Level 2
+r2 = conv_pc_2(r1_pooled)         # (B, 4, 4, 512)
+e2 = r1_pooled - predict_down_2(r2) # (B, 4, 4, 256)
+
+# Spatial pooling Level 2 → Level 3
+r2_pooled = pool(r2)               # (B, 2, 2, 512)
+
+# PC Level 3
+r3 = fc_pc_3(r2_pooled.flatten(1)) # (B, num_classes)
+e3 = r2_pooled - predict_down_3(r3) # (B, 2, 2, 512)
+
+# Inference update (one step, all levels simultaneously)
+r1 += lr * (e1 - W2.T @ e2)       # (B, 8, 8, 256)
+r2 += lr * (e2 - W3.T @ e3)       # (B, 4, 4, 512)
+r3 += lr * e3                      # (B, num_classes) — top level: no e_above
+Fill in the actual numbers from your architecture before generating any code. Every AI prompt for a module should include the relevant slice of this trace.
+
+This trace follows one batch of B images through a forward pass plus one inference step of the JEPA-PC composite. Every tensor shape is shown as a comment. This is the source of truth for all module boundaries — if any module's contract deviates from this trace, it is a bug.
+python
+
+# ---------------------------------------------------------------------------
+# 0. INPUT
+# ---------------------------------------------------------------------------
+x = images                                  # (B, 3, 32, 32)   float32
+
+# ---------------------------------------------------------------------------
+# 1. JEPA TOKENIZER (frozen, eval mode, no grad)
+# ---------------------------------------------------------------------------
+# Patch embedding: 4x4 patches → 8x8 grid = 64 patches
+patches = patch_embed(x)                    # (B, 64, 128)     float32
+# Context encoder (small ViT, 4 layers)
+tokens = context_encoder(patches)           # (B, 64, 128)     float32
+# Restore 2D spatial layout — THIS IS THE CRITICAL RESHAPE
+grid = tokens.reshape(B, 8, 8, 128)         # (B, 8, 8, 128)   float32
+# 'grid' is the bottom-level "sensory" input to the PC hierarchy
+
+# ---------------------------------------------------------------------------
+# 2. PC LEVEL 1 — convolutional over token grid
+#    ConvPCLayer(in_channels=128, out_channels=256, kernel_size=3)
+# ---------------------------------------------------------------------------
+# One-shot forward pass to seed the representation r1
+r1 = conv_pc_1.forward(grid)                # (B, 8, 8, 256)   float32
+# Top-down prediction of the token grid from r1
+# Uses a learned convolution (256 → 128, k=3)
+pred_1 = predict_down_1(r1)                 # (B, 8, 8, 128)   float32
+# Prediction error at the token level
+e1 = grid - pred_1                          # (B, 8, 8, 128)   float32
+
+# ---------------------------------------------------------------------------
+# 3. SPATIAL POOLING LEVEL 1 → LEVEL 2
+# ---------------------------------------------------------------------------
+# 2×2 average pooling, stride 2
+r1_pooled = pool_2x2(r1)                    # (B, 4, 4, 256)   float32
+
+# ---------------------------------------------------------------------------
+# 4. PC LEVEL 2 — convolutional over pooled grid
+#    ConvPCLayer(in_channels=256, out_channels=512, kernel_size=3)
+# ---------------------------------------------------------------------------
+r2 = conv_pc_2.forward(r1_pooled)           # (B, 4, 4, 512)   float32
+# Top-down prediction of r1_pooled from r2
+pred_2 = predict_down_2(r2)                 # (B, 4, 4, 256)   float32
+# Prediction error at the pooled Level‑1 representation
+e2 = r1_pooled - pred_2                     # (B, 4, 4, 256)   float32
+
+# ---------------------------------------------------------------------------
+# 5. SPATIAL POOLING LEVEL 2 → LEVEL 3
+# ---------------------------------------------------------------------------
+r2_pooled = pool_2x2(r2)                    # (B, 2, 2, 512)   float32
+r2_flat = r2_pooled.reshape(B, -1)          # (B, 2048)        float32
+
+# ---------------------------------------------------------------------------
+# 6. PC LEVEL 3 — fully connected (scene / category level)
+#    PCLayer(in_features=2048, out_features=10)   (CIFAR‑10 classes)
+# ---------------------------------------------------------------------------
+r3 = fc_pc_3.forward(r2_flat)               # (B, 10)          float32
+# Top-down prediction of r2_pooled from r3
+pred_3_flat = predict_down_3(r3)            # (B, 2048)        float32
+pred_3 = pred_3_flat.reshape(B, 2, 2, 512)  # (B, 2, 2, 512)   float32
+# Prediction error at the pooled Level‑2 representation
+e3 = r2_pooled - pred_3                     # (B, 2, 2, 512)   float32
+
+# ---------------------------------------------------------------------------
+# 7. INFERENCE UPDATE (one parallel step, all levels)
+#    Weights are HELD FIXED.  Only representations r1,r2,r3 are updated.
+#    η = inference learning rate (scalar).
+#    W2.T denotes the transposed convolution + upsampling that projects
+#    e2 back into the space of r1.  W3.T is the transposed fully‑connected
+#    weight that projects e3 (flattened) back into the space of r2.
+# ---------------------------------------------------------------------------
+
+# Level 1 update:
+# e1 is (B,8,8,128) — error from below (token grid)
+# W2.T @ e2 involves upsampling e2 (4,4,256) → (8,8,256) and a transposed
+# convolution to match r1's channel dimension (256).  Output shape (8,8,256).
+r1 = r1 + lr * (e1 - W2.T @ e2)             # (B, 8, 8, 256)   float32
+
+# Level 2 update:
+# e2 is (B,4,4,256) — error from below (r1_pooled)
+# W3.T @ e3 flattens e3 (2,2,512)→(2048,), then W3.T (10 → 2048) gives (10,).
+# To match r2's space we reshape/upsample appropriately; here the composite
+# ensures the projected error is added in a shape-compatible way.
+r2 = r2 + lr * (e2 - W3.T @ e3)             # (B, 4, 4, 512)   float32
+
+# Level 3 update (top level — no error from above):
+# e3 is the error at Level‑2 pooled space.  The gradient w.r.t. r3 is
+# W3.T @ e3_flat, so:
+r3 = r3 + lr * (W3.T @ e3.reshape(B, -1))   # (B, 10)          float32
+
+Critical invariants enforced by this trace:
+
+    The JEPA tokenizer’s output reshapes from (B,64,128) → (B,8,8,128) exactly once; the 2D layout is never flattened afterward.
+
+    All pooling is 2×2, stride 2, maintaining the spatial hierarchy.
+
+    During inference, no weight tensors (conv_pc_*.W, fc_pc_3.W) receive gradients.
+
+    Precision weights (not shown in this trace) are normalised within each level before being applied to errors — see the Interface Contract.
+
+Where shape mismatches kill projects (and how this trace catches them):
+
+    If the JEPA reshape is forgotten, PC Level 1 receives a flat vector and the convolutional prior is destroyed.
+
+    If pooling strides are inconsistent with kernel sizes, the grid dimensions won’t halve cleanly (8→4→2).
+
+    If W3.T @ e3 is not properly reshaped/upsampled to match r2’s shape, the update will broadcast silently to wrong dimensions — the explicit (2,2,512) → (4,4,512) mapping is mandatory.
+
+
+This trace is to be pasted into every AI prompt that generates code touching the full pipeline.
+

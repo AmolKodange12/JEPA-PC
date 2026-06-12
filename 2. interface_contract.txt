@@ -1,0 +1,525 @@
+2. Interface Contract Document (the most important one)
+INSTRUCTIONS:
+
+What it is: for every class and function that will be written, specifies the exact input shapes, output shapes, dtypes, and any invariants — before any implementation is written.
+Why it prevents failures: the most common reason AI-generated modules fail on integration is shape mismatches at boundaries. The JEPA tokenizer outputs (B, 64, 128). PC Level 1 expects (B, 8, 8, 128). That reshape needs to be in the contract, not discovered at runtime.
+What it must contain, for every module:
+Class: ConvPCLayer
+File: models/pc_conv.py
+
+__init__ params:
+  in_channels: int        # token dim at input (128 for JEPA output)
+  out_channels: int       # representation dim at this level
+  kernel_size: int        # receptive field over token grid (e.g. 3)
+
+forward(x) — NOT used during inference; only initialises r
+  x:      (B, H, W, C)   float32   — token grid
+  return: (B, H, W, out_channels)  float32
+
+inference_step(r, r_above, e_below, e_above, precision)
+  r:         (B, H, W, C)    — current representation at this level
+  r_above:   (B, H', W', C') — representation at level above (after pooling)
+  e_below:   (B, H, W, C)    — prediction error from level below
+  e_above:   (B, H', W', C') — prediction error from level above
+  precision: (B, H, W, C)    — precision weights at this level (normalised)
+  return:    updated r, same shape
+
+Invariants:
+  - W (weights) must not receive gradients during inference_step
+  - precision must be normalised within-level before this call
+  - spatial layout of r must match layout of x passed at init
+This document is what you paste into every AI prompt that generates a new module. It is the contract every module must satisfy.
+This document defines the precise input/output shapes, dtypes, and invariants for every module, class, and function that will be implemented. It serves as the binding contract to be pasted into every AI prompt that generates a new module. All code must conform exactly to these specifications; any deviation is a bug.
+
+All tensors are torch.float32 unless explicitly stated otherwise.
+Batch dimension is B. Spatial dimensions are named H, W. Channel dimension is C.
+All shape annotations follow the PyTorch convention (B, ...).
+1. utils/ema.py
+Function: update_target_encoder
+python
+
+def update_target_encoder(online_encoder: nn.Module, target_encoder: nn.Module, momentum: float = 0.996) -> None:
+    """
+    Exponential moving average update of the target encoder's parameters.
+    Target encoder NEVER receives a gradient — this is enforced outside this function.
+    """
+
+    Parameters
+    online_encoder – nn.Module, source of the latest weights (trained by gradient descent)
+    target_encoder – nn.Module, recipient of the EMA weights
+    momentum – float, decay factor for EMA (must be in [0, 1])
+
+    Returns
+    None — updates target_encoder parameters in-place.
+
+    Invariants
+
+        Must be called after every optimizer step on online_encoder.
+
+        target_encoder parameters must have requires_grad = False at all times (set once after creation).
+
+        The update rule for every parameter p_online, p_target:
+        p_target.data = momentum * p_target.data + (1 - momentum) * p_online.data
+
+        No gradients are ever computed for the target encoder.
+
+2. models/jepa_tokenizer.py
+Class: JEPATokenizer
+
+Implements the full JEPA architecture: an online context encoder, a target encoder (EMA copy), and a predictor. Only the online encoder and predictor are trained; the target encoder is updated via EMA.
+
+__init__ parameters:
+Parameter	Type	Default	Description
+image_size	int	32	Input image spatial size (square)
+patch_size	int	4	Size of each square patch
+num_patches	int	Derived	(image_size // patch_size) ** 2 = 64
+dim	int	128	Token embedding dimension
+depth	int	4	Number of ViT layers in the context encoder
+heads	int	4	Number of attention heads
+mlp_dim	int	256	Hidden dimension of the MLP inside each ViT layer
+predictor_depth	int	2	Number of layers in the predictor MLP
+momentum	float	0.996	EMA momentum for target encoder updates
+
+Method: encode (context encoder, frozen during PC stages)
+python
+
+def encode(self, x: Tensor) -> Tensor:
+    """Extract token grid from an image using the online context encoder.
+       This is the entry point for the PC hierarchy.
+       NEVER returns gradients to the JEPA when the tokenizer is frozen."""
+
+    Input
+    x – (B, 3, image_size, image_size), float32, pixel values in [0, 1] or normalized.
+
+    Output
+    Token grid: (B, 8, 8, dim) = (B, 8, 8, 128), float32.
+    Spatial layout preserved — token at [h, w] corresponds to the image patch at that position.
+    Positional embeddings are included inside the encoder.
+
+    Invariants
+
+        When the tokenizer is frozen, all parameters of the context encoder have requires_grad = False.
+
+        The output retains the 2D grid shape; it is never flattened.
+
+        Two calls with the same input must return identical tokens (deterministic).
+
+        The encoder runs in eval() mode during PC training/inference.
+
+Method: encode_target (target encoder, never trained)
+python
+
+def encode_target(self, x: Tensor) -> Tensor:
+    """Extract target token grid using the EMA target encoder.
+       Stop-gradient is applied inside this function."""
+
+    Input
+    x – (B, 3, 32, 32), float32.
+
+    Output
+    Target token grid: (B, 8, 8, 128), float32, no gradient attached (detached from computation graph).
+
+    Invariants
+
+        Target encoder parameters never receive a gradient — torch.no_grad() context is used.
+
+        Output is always detached; the caller must never call .backward() through it.
+
+        Architecture identical to encode but with EMA weights.
+
+Method: forward (training only)
+python
+
+def forward(self, x: Tensor, mask: Tensor) -> Tensor:
+    """Predict the target tokens for masked positions."""
+
+    Input
+    x – (B, 3, 32, 32), float32, input image.
+    mask – (B, 64), bool, where True indicates a token position to be predicted (masked out in the context encoder). The mask is applied after patch embedding; context encoder sees only unmasked tokens.
+
+    Output
+    predicted – (B, M, 128), float32, where M = mask.sum(dim=1) is the number of masked tokens (may vary per sample). The order of masked tokens matches the flattened scan of mask.
+
+    Invariants
+
+        The context encoder processes only unmasked tokens. The predictor receives the context tokens and the mask positions and outputs predictions at those positions.
+
+        The target encoder processes the full image to produce target tokens; those at masked positions are used for loss.
+
+        encode is not used during training; forward is used only in Stage 2.
+
+Function: jepa_loss
+python
+
+def jepa_loss(predicted: Tensor, target: Tensor) -> Tensor:
+    """Cosine-similarity loss between predicted and target tokens."""
+
+    Parameters
+    predicted – (B, M, 128), float32, predicted token vectors.
+    target – (B, M, 128), float32, target token vectors (detached, from target encoder).
+
+    Returns
+    Scalar loss, shape (), float32.
+    Loss = 1 - cosine_similarity(predicted, target, dim=-1).mean()
+
+    Implementation
+    python
+
+    predicted = F.normalize(predicted, dim=-1)
+    target    = F.normalize(target,    dim=-1)
+    return 1 - (predicted * target).sum(dim=-1).mean()
+
+    Invariants
+
+        target must already be detached (no gradient flow).
+
+        The function does not modify its inputs.
+
+3. models/pc_layer.py — Vanilla FC Predictive Coding Layer
+Class: PCLayer
+
+A single fully-connected predictive coding layer. Used in Stage 1 (MNIST) and optionally in higher PC levels (Level 2/3 after pooling).
+
+__init__ parameters:
+Parameter	Type	Description
+in_features	int	Dimensionality of input from the layer below (e.g., 784 for MNIST pixels)
+out_features	int	Dimensionality of this layer's representation (e.g., 256)
+
+Method: forward — initialisation only, not used during inference
+python
+
+def forward(self, x: Tensor) -> Tensor:
+    """Produce the initial representation `r` for this layer given bottom-up input `x`.
+       This is used only once per input to set the starting state of the inference loop."""
+
+    Input
+    x – (B, in_features), float32, bottom-up input (e.g., from lower layer or raw pixels).
+
+    Output
+    r_init – (B, out_features), float32, initial representation for this layer.
+
+    Invariants
+
+        forward does not store any hidden state; it only computes r_init as a function of x. In the simplest form r_init = x @ W_bottom_up, but the exact projection is internal.
+
+        This method is called exactly once per input before starting the inference loop.
+
+Method: inference_step
+python
+
+def inference_step(self, r_below: Tensor, r: Tensor, e_above: Tensor, lr_infer: float) -> Tensor:
+    """Perform one step of the PC inference update for this layer.
+       Weights are NOT updated — they are held fixed.
+       `r` is updated in-place or a new tensor is returned (contract: returns updated r)."""
+
+    Parameters
+    r_below – (B, in_features), float32, representation of the layer below.
+    r – (B, out_features), float32, current representation of this layer.
+    e_above – (B, out_features), float32, prediction error from the layer above this one (already projected down via W_next.T by the layer above). If this is the top level, e_above is a zero tensor.
+    lr_infer – float, inference step size (η).
+
+    Returns
+    r_updated – (B, out_features), float32, updated representation after one inference step.
+
+    Computation
+
+        prediction = self.W @ r # top-down prediction of r_below
+
+        e = r_below - prediction # prediction error from below (this level's error)
+
+        delta_r = lr_infer * (e - self.W.T @ e_above) # energy gradient
+
+        r_new = r + delta_r
+
+        Return r_new
+
+    Invariants
+
+        self.W (shape (in_features, out_features)) must not receive gradients during inference_step. No W.grad is populated; weights are held constant.
+
+        The computation must not modify r_below or e_above.
+
+        If e_above is not provided (top level), the term self.W.T @ e_above is omitted (equivalent to e_above = zeros).
+
+        Precision weighting is not applied in Stage 1; this method assumes uniform precision. (Later, precision can be integrated as element-wise multiplication of e and e_above.)
+
+Method: update_weights
+python
+
+def update_weights(self, e: Tensor, r: Tensor, lr_weights: float) -> None:
+    """Hebbian weight update: W += lr_weights * outer(e, r). Called only after inference has converged."""
+
+    Parameters
+    e – (B, in_features), float32, final prediction error from below (after convergence).
+    r – (B, out_features), float32, final representation of this layer.
+    lr_weights – float, learning rate for weights.
+
+    Returns
+    None — updates self.W in-place.
+
+    Computation
+    self.W += lr_weights * torch.einsum('bi,bo->io', e, r) / B (or using batch outer product sum).
+
+    Invariants
+
+        Must be called only after the inference loop has converged (errors are stable).
+
+        No gradient book-keeping (pure Hebbian, local).
+
+        e and r are detached from the inference graph.
+
+4. models/pc_conv.py — Convolutional PC Layer
+Class: ConvPCLayer
+
+A convolutional predictive coding layer operating over a 2D token grid. Used for PC Level 1 (and optionally Level 2) over the JEPA token grid.
+
+__init__ parameters:
+Parameter	Type	Description
+in_channels	int	Number of channels at the input grid (128 for JEPA output)
+out_channels	int	Number of channels for this layer's representation
+kernel_size	int	Spatial extent of the local receptive field (e.g., 3)
+stride	int (default=1)	Stride of the convolution (controls downsampling between levels; pooling is separate)
+padding	int (default=kernel_size//2)	Padding to preserve spatial size
+
+Method: forward — initialisation only, not used during inference
+python
+
+def forward(self, x: Tensor) -> Tensor:
+    """Produce the initial representation `r` for this level given the token grid `x`.
+       Spatial layout is preserved."""
+
+    Input
+    x – (B, H, W, in_channels), float32, input token grid (e.g., (B, 8, 8, 128)).
+
+    Output
+    r_init – (B, H, W, out_channels), float32, initial representation.
+
+    Invariants
+
+        The output spatial shape (H, W) matches the input spatial shape (padding used).
+
+        This method is used only once to seed r before inference starts.
+
+Method: inference_step
+python
+
+def inference_step(self,
+                   r: Tensor,
+                   r_above: Tensor,
+                   e_below: Tensor,
+                   e_above: Tensor,
+                   precision: Tensor) -> Tensor:
+    """One inference update for this convolutional PC layer."""
+
+    Parameters
+    r – (B, H, W, out_channels), float32, current representation at this level.
+    r_above – (B, H', W', out_channels_above), float32, representation from the level above (spatially coarser if pooling is used between levels). This is used to compute the top-down prediction to this level.
+    e_below – (B, H, W, out_channels), float32, prediction error from the level below (the mismatch between r and what the level below expected). In this convolutional setting, the error is defined at the same spatial positions as r.
+    e_above – (B, H, W, out_channels), float32, prediction error from the level above — that is, the error from the next level up, already projected/upsampled to match the spatial and channel dimensions of this level. The caller (PC hierarchy) is responsible for ensuring the projection.
+    precision – (B, H, W, out_channels), float32, precision weights (inverse variance) at each spatial location and channel. Must be normalised within the level before this call (see invariant). In Stage 1–3 vanilla versions, precision may be a tensor of ones.
+
+    Returns
+    r_updated – (B, H, W, out_channels), float32, updated representation.
+
+    Computation outline
+
+        e = e_below (or e_below - W_conv(r_above) if using explicit top-down prediction; here e_below already contains the error from the lower layer).
+
+        The update rule:
+        r_new = r + lr_infer * (precision * e - W_back.T * (precision * e_above))
+        where W_back.T is a transposed convolution that maps e_above (which has same channels as r) back to the same shape but through the receptive field. In a simple implementation using standard convolution, the top-down weight W is the convolution kernel mapping r to a prediction of the layer below. Thus e_below is already the prediction error. The term from above is the back-projection of the error from above through W^T.
+
+        The inference learning rate lr_infer is a global hyperparameter or per-layer.
+
+    Invariants
+
+        No gradients on weights: The convolution kernels self.W (used to generate predictions) must not accumulate gradients during inference_step.
+
+        Precision normalisation: precision must be normalised within the level prior to this call (e.g., dividing by the sum over spatial positions or per-channel, to avoid scale differences across levels).
+
+        Spatial layout: The output r_updated must preserve the same spatial grid (H, W) as the input r. The spatial mapping between levels (e.g., upsampling of e_above to this level's grid) is the responsibility of the hierarchy, not this layer.
+
+        The update does not modify r in-place; it returns a new tensor. The caller overwrites r.
+
+Method: update_weights
+python
+
+def update_weights(self, e: Tensor, r: Tensor, lr_weights: float) -> None:
+    """Local Hebbian update for the convolutional kernel."""
+
+    Parameters
+    e – (B, H, W, out_channels), float32, final prediction error (from below).
+    r – (B, H, W, out_channels), float32, final representation at this level.
+    lr_weights – float, learning rate.
+
+    Returns
+    None — updates self.W in-place.
+
+    Computation
+    Approximate outer product over patches: for each local patch of r and e, accumulate the outer product to the kernel. Implementation detail: can be done via torch.nn.functional.conv2d with gradient disabled. Exact contract: the weight update is proportional to the sum over all positions of the outer product of the error vector at a position and the representation vector at the corresponding position in the receptive field.
+
+    Invariants
+
+        Called only after inference has converged.
+
+        No gradient flow through this update.
+
+5. models/composite.py — JEPA-PC Composite
+Class: JEPAPCComposite
+
+Assembles the frozen JEPA tokenizer and a 3-level PC hierarchy. Handles token extraction, inference loop orchestration, and precision computation.
+
+__init__ parameters:
+Parameter	Type	Description
+jepa_tokenizer	JEPATokenizer	Pretrained, frozen JEPA tokenizer. Must have encode(x) -> (B,8,8,128).
+pc_levels	List of PC layers	A list of three layers: [ConvPCLayer, ConvPCLayer (or PCLayer after pooling), PCLayer]. The exact types and dimensions are determined by the architecture.
+pool_sizes	List[int] or None	Spatial pooling factors between levels, e.g., [2, 2] means pool by 2 after Level1→Level2, and again after Level2→Level3.
+infer_steps	int	Default number of inference iterations (e.g., 20).
+infer_lr	float	Inference step size.
+precision_normalize	bool	Whether to normalise precision within each level (always True in final).
+
+Method: extract_tokens
+python
+
+def extract_tokens(self, image: Tensor) -> Tensor:
+    """Run the frozen JEPA tokenizer and return the token grid."""
+
+    Input
+    image – (B, 3, 32, 32), float32.
+
+    Output
+    tokens – (B, 8, 8, 128), float32, detached from the JEPA (no gradient).
+
+    Invariants
+
+        JEPA tokenizer is in eval() mode with requires_grad=False.
+
+        The output maintains the 2D spatial grid.
+
+Method: inference
+python
+
+def inference(self, image: Tensor, n_steps: int = None) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
+    """Run the full PC inference loop on an image. Returns final representations, prediction errors, and precision tensors for each level."""
+
+    Input
+    image – (B, 3, 32, 32), float32.
+    n_steps – int, optional, overrides the default number of inference iterations.
+
+    Output
+    r_list – list of three tensors:
+
+        r_level1: (B, 8, 8, C1), float32 (channel dim depends on config, e.g., 128)
+
+        r_level2: (B, 4, 4, C2), float32 (after pooling)
+
+        r_level3: (B, C3,), float32 (after global pool or FC)
+        (Exact shapes are configurable; contract here shows the expected hierarchy structure with pooling of 2 each.)
+        e_list – list of three tensors with corresponding shapes (prediction errors at each level).
+        prec_list – list of three tensors of precision weights at each level, same shapes as errors.
+
+    Invariants
+
+        The inference loop runs for exactly n_steps steps, or until a convergence criterion if implemented (optional).
+
+        During inference, all PC layer weights are held constant (no weight updates).
+
+        After the loop, the returned r_list contains the final, settled representations.
+
+        Precision tensors are normalised within each level before being used in the inference_step calls.
+
+        The tokenizer is run once at the beginning; tokens are reused across inference steps.
+
+Method: train_step (optional, for continual learning experiments)
+python
+
+def train_step(self, image: Tensor, label: Tensor, optimizer: Optimizer) -> float:
+    """Perform one full training step: inference until convergence, then Hebbian weight update on PC layers."""
+
+    Input
+    image – (B, 3, 32, 32), float32.
+    label – (B,), int64, class labels (used to compute top-level error if supervised, or not used in unsupervised mode).
+    optimizer – PyTorch optimizer (may be unused if pure Hebbian; but can be used if some layers use backprop for the final classification head). In a purely Hebbian PC, the optimizer is not used for PC weights; but the composite may include a linear classifier head trained with backprop.
+
+    Returns
+    loss – float scalar, the total training loss (e.g., sum of prediction errors or classification loss).
+
+    Invariants
+
+        Weight updates on PC layers are local (Hebbian) and happen only after inference has converged (error < threshold or fixed steps).
+
+        Tokenizer remains frozen; no gradient flows to it.
+
+6. experiments/ — Evaluation Functions
+Function: evaluate_inference_adaptation
+python
+
+def evaluate_inference_adaptation(model: JEPAPCComposite, images: Tensor, occlusion_fn: Callable, n_steps: int = 20) -> Dict[str, Any]:
+
+    Parameters
+    model – A JEPAPCComposite instance (or any model that exposes inference method).
+    images – (N, 3, 32, 32), float32, batch of test images.
+    occlusion_fn – function (images, level) -> occluded_images, where level is a float between 0 and 1 indicating fraction of occlusion.
+    n_steps – int, number of inference iterations.
+
+    Returns
+    Dictionary with keys:
+
+        acc_r0 : float, linear-probe accuracy using r after 0 inference steps (initial representation).
+
+        acc_rn : float, linear-probe accuracy using final r after n_steps steps.
+
+        accuracy_per_step : List[float] of length n_steps+1, accuracy at each step.
+        Expects to plot accuracy_per_step for multiple occlusion levels.
+
+    Invariants
+
+        Linear probe is trained separately on frozen representations from the tokenizer + PC (after each step).
+
+        Occlusion must be spatial contiguous block masking, not Gaussian noise.
+
+        The model is not updated during evaluation.
+
+Function: goal_directed_inference
+python
+
+def goal_directed_inference(model: JEPAPCComposite, tokens: Tensor, uncertainty_threshold: float = 0.1, max_steps: int = 50) -> Tuple[List[Tensor], List[Tensor], int]:
+
+    Parameters
+    model – A JEPAPCComposite instance.
+    tokens – (B, 8, 8, 128), float32, pre-extracted token grid (or can be images if function handles extraction). The contract: expects raw tokens already extracted (so caller extracts).
+    uncertainty_threshold – float, terminate when mean uncertainty (1/precision) across all tokens falls below this threshold.
+    max_steps – int, safety limit.
+
+    Returns
+    r_list – final representations (same format as model.inference output).
+    prec_list – final precision tensors for each level.
+    steps_taken – int, number of inference steps actually executed.
+
+    Invariants
+
+        The loop terminates early if torch.mean(1.0 / prec) < uncertainty_threshold.
+
+        Uses the same inference_step machinery; no new logic.
+
+        Useful for measuring computational cost vs. convergence.
+
+7. Common Invariants Across All Modules
+
+    Dtype: All tensors are torch.float32 unless stated.
+
+    Device: All tensors within a forward pass must reside on the same device (CPU or GPU).
+
+    Gradient flow: During inference (PC loop), gradients must not be tracked. Use torch.no_grad() context or detach appropriately. During weight updates, only the relevant weights receive manual updates (no .backward() through the inference graph).
+
+    Batch consistency: All functions assume the first dimension is batch; no single-sample branching that breaks batched operation.
+
+    Reproducibility: All random initialisations must be seedable. The EMA and inference loop are deterministic given fixed inputs and seeds.
+
+This contract is the source of truth. Any code that violates these shapes, dtypes, or invariants is incorrect, no matter how plausible it looks.
+
+
+
+
+
+
