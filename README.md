@@ -451,59 +451,54 @@ The following extensions follow naturally from the composite design but are out 
 **Explicit goal states and temporal inference (Active Inference Level 3).** Inject a target representation at PC Level 3 encoding a desired future state. Run inference to minimise the gap between current and desired state rather than to explain the current input. This requires a temporal model — a learned transition function over token grids — and is only tractable with sequential data. V-JEPA (Bardes et al., 2024) provides a natural tokenizer for this extension: its tokens are already temporal, and PC Level 3's goal state would become a prediction about a future token grid.
 
 **Temporal hierarchy.** The current PC hierarchy is spatial only (patch → region → scene). LeCun's full hierarchical world model is also temporal: higher levels predict over longer horizons. With video tokens, PC levels would map onto both spatial scales and prediction horizons simultaneously — a direct instantiation of the temporal dimension currently absent from the design.
-
----
-
-
-
+```text
 jepa-pc-composite/
 │
-├── README.md                          ← this file
-├── requirements.txt                   ← pinned dependencies
-├── setup.md                           ← environment + dataset download instructions
+├── README.md                      ← this file
+├── requirements.txt               ← pinned dependencies
+├── setup.md                       ← environment + dataset download instructions
 │
-├── configs/                           ← all hyperparameters live here (no magic numbers in code)
-│   ├── pc_mnist.yaml                  ← Stage 1
-│   ├── jepa_cifar10.yaml              ← Stage 2 (incl. AMP / batch / grad-accum settings)
-│   ├── pc_tokens_cifar10.yaml         ← Stage 3
-│   └── composite_cifar100.yaml        ← Stage 4
+├── configs/                       ← all hyperparameters live here (no magic numbers in code)
+│   ├── pc_mnist.yaml              ← Stage 1
+│   ├── jepa_cifar10.yaml          ← Stage 2 (incl. AMP / batch / grad-accum settings)
+│   ├── pc_tokens_cifar10.yaml     ← Stage 3
+│   └── composite_cifar100.yaml    ← Stage 4
 │
-├── notebooks/                         ← one notebook per stage (the narrative / results)
-│   ├── 01_vanilla_pc_mnist.ipynb      ← Stage 1
-│   ├── 02_jepa_cifar10.ipynb          ← Stage 2
-│   ├── 03_pc_on_patch_tokens.ipynb    ← Stage 3
-│   └── 04_composite_evaluation.ipynb  ← Stage 4
+├── notebooks/                     ← one notebook per stage (the narrative / results)
+│   ├── 01_vanilla_pc_mnist.ipynb
+│   ├── 02_jepa_cifar10.ipynb
+│   ├── 03_pc_on_patch_tokens.ipynb
+│   └── 04_composite_evaluation.ipynb
 │
-├── models/                            ← reusable model code (imported by notebooks)
-│   ├── pc_layer.py                    ← PCLayer, PCNetwork (inference loop + local learning)
-│   ├── pc_conv.py                     ← ConvPCLayer: convolutional PC over the token grid
-│   ├── jepa_tokenizer.py              ← PatchEmbed, ContextEncoder, EMATargetEncoder, Predictor
-│   └── composite.py                   ← JEPAPCComposite: frozen tokenizer + conv-PC hierarchy
+├── models/                        ← reusable model code (imported by notebooks)
+│   ├── pc_layer.py
+│   ├── pc_conv.py
+│   ├── jepa_tokenizer.py
+│   └── composite.py
 │
-├── experiments/                       ← evaluation logic, kept separate from models
-│   ├── linear_probe.py                ← representation quality at each level
-│   ├── inference_adaptation.py        ← occlusion + iterative-inference evaluation (Eval 1)
-│   ├── continual_learning.py          ← sequential tasks + forgetting metrics + baselines (Eval 2)
-│   └── precision_uncertainty.py       ← precision maps + uncertainty checks (Eval 3)
+├── experiments/                   ← evaluation logic, kept separate from models
+│   ├── linear_probe.py
+│   ├── inference_adaptation.py
+│   ├── continual_learning.py
+│   └── precision_uncertainty.py
 │
-├── utils/                             ← shared helpers
-│   ├── data.py                        ← dataset loading, CIFAR-100 task splits, occlusion fns
-│   ├── ema.py                         ← EMA target-encoder update
-│   ├── metrics.py                     ← accuracy, forgetting, convergence, variance/collapse
-│   └── viz.py                         ← reconstruction, nearest-neighbour, precision-map plots
+├── utils/                         ← shared helpers
+│   ├── data.py
+│   ├── ema.py
+│   ├── metrics.py
+│   └── viz.py
 │
-├── checkpoints/                       ← saved weights (esp. the FROZEN tokenizer from Stage 2)
+├── checkpoints/
 │   └── .gitkeep
 │
-├── results/                           ← logged metrics, figures, tables for the writeup
+├── results/
 │   └── .gitkeep
 │
-└── tests/                             ← small correctness tests (run before trusting results)
-    ├── test_pc_convergence.py         ← errors decrease monotonically; loop converges
-    ├── test_jepa_no_collapse.py       ← embedding variance stays above threshold
-    └── test_spatial_layout.py         ← token grid position is preserved into PC Level 1
-
----
+└── tests/
+    ├── test_pc_convergence.py
+    ├── test_jepa_no_collapse.py
+    └── test_spatial_layout.py
+```
 
 ## Setup / quickstart
 
