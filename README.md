@@ -298,7 +298,7 @@ class PCLayer(nn.Module):
 | No learning | Inference never converges before weight update fires | Add explicit convergence criterion |
 | Posterior collapse at high levels | Unconstrained representations | Add L2 regularisation on r |
 
-**Deliverable:** `notebooks/01_vanilla_pc_mnist.ipynb`  
+**Deliverable:** `stages/01_vanilla_pc_mnist.py`  
 **References:** Rao & Ballard (1999, eqs. 1–4); Bogacz (2017) for update derivation.
 
 ---
@@ -346,7 +346,7 @@ def jepa_loss(predicted, target):
 - [ ] Nearest neighbours in embedding space are semantically similar — visualise
 - [ ] EMA confirmed working: target weights ≠ online weights but track them slowly
 
-**Deliverable:** `notebooks/02_jepa_cifar10.ipynb`  
+**Deliverable:** `stages/02_jepa_cifar10.py`  
 **Reference:** Assran et al. (2023), Section 3 and Appendix A.
 
 ---
@@ -377,7 +377,7 @@ def jepa_loss(predicted, target):
 - [ ] Prediction errors are high on occluded or ambiguous patches, low on clear ones
 - [ ] Token grid position is recoverable inside PC Level 1 (confirm spatial layout intact)
 
-**Deliverable:** `notebooks/03_pc_on_patch_tokens.ipynb`
+**Deliverable:** `stages/03_pc_on_patch_tokens.py`
 
 ---
 
@@ -390,7 +390,7 @@ def jepa_loss(predicted, target):
 - `JEPAPCComposite`: frozen JEPA tokenizer + 3-level convolutional PC hierarchy
 - Evaluation harnesses in `experiments/` (see §8)
 
-**Deliverables:** `notebooks/04_composite_evaluation.ipynb`, `models/composite.py`
+**Deliverables:** `stages/04_composite_evaluation.py`, `models/composite.py`
 
 ---
 
@@ -521,7 +521,7 @@ jepa-pc-composite/
 │   ├── pc_tokens_cifar10.yaml          ← Stage 3
 │   └── composite_cifar100.yaml         ← Stage 4
 │
-├── models/                             ← reusable model code, imported by notebooks
+├── models/                             ← reusable model code, imported by stages
 │   ├── pc_layer.py                     ← PCLayer, PCNetwork — inference loop + Hebbian learning
 │   ├── pc_conv.py                      ← ConvPCLayer — convolutional PC over token grid
 │   ├── jepa_tokenizer.py               ← PatchEmbed, ContextEncoder, EMATargetEncoder, Predictor
@@ -533,11 +533,11 @@ jepa-pc-composite/
 │   ├── continual_learning.py           ← sequential tasks + forgetting metrics + baselines (Eval 2)
 │   └── precision_uncertainty.py        ← precision maps + goal-directed inference (Eval 3)
 │
-├── notebooks/                          ← one notebook per stage (narrative + results)
-│   ├── 01_vanilla_pc_mnist.ipynb
-│   ├── 02_jepa_cifar10.ipynb
-│   ├── 03_pc_on_patch_tokens.ipynb
-│   └── 04_composite_evaluation.ipynb
+├── stages/                             ← one script per stage (narrative + results)
+│   ├── 01_vanilla_pc_mnist.py          ← # %% cells, run with python or VS Code interactive
+│   ├── 02_jepa_cifar10.py
+│   ├── 03_pc_on_patch_tokens.py
+│   └── 04_composite_evaluation.py
 │
 ├── utils/
 │   ├── data.py                         ← dataset loading, CIFAR-100 task splits, occlusion fns
@@ -570,10 +570,11 @@ pip install -r requirements.txt
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 
 # 3. Run stages in order — each gates the next
-jupyter notebook notebooks/01_vanilla_pc_mnist.ipynb       # Stage 1: verify PC works
-jupyter notebook notebooks/02_jepa_cifar10.ipynb           # Stage 2: train tokenizer, confirm no collapse
-jupyter notebook notebooks/03_pc_on_patch_tokens.ipynb     # Stage 3: PC on frozen tokens, grid preserved
-jupyter notebook notebooks/04_composite_evaluation.ipynb   # Stage 4: three evaluations
+python stages/01_vanilla_pc_mnist.py       # Stage 1: verify PC works
+python stages/02_jepa_cifar10.py           # Stage 2: train tokenizer, confirm no collapse
+python stages/03_pc_on_patch_tokens.py     # Stage 3: PC on frozen tokens, grid preserved
+python stages/04_composite_evaluation.py   # Stage 4: three evaluations
+# Or open any stage in VS Code — the # %% markers make cells interactive
 ```
 
 **Golden rules:**
