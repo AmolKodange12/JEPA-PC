@@ -3,106 +3,131 @@ import torch.nn as nn
 
 
 class PCLayer(nn.Module):
-    """Single PC layer.
+    """Latent-state holder for predictive coding — no weights.
 
-    W  : top-down prediction weights (in_features, out_features) — frozen during inference
-    r  : current representation (B, out_features) — updated every inference step
-    e  : prediction error (B, in_features) — propagated upward
+    During training: stores latent x as nn.Parameter, returns x (not mu) in the
+    forward pass, and computes energy E = 0.5 * ||x - mu||^2.
+    During eval: identity pass-through (returns mu), behaving like a regular net.
 
-    INFERENCE (weights frozen, n_steps iterations):
-        prediction = tanh(W @ r)
-        e          = r_below - prediction
-        r         += lr_infer * ( W.T @ (e * tanh') - e_above )
-
-    LEARNING (only after inference converges):
-        dW = e.T @ r / B                        # local Hebbian
-        W += lr_weights * dW
+    Matches the Bogacz-Group reference implementation:
+    https://github.com/Bogacz-Group/PredictiveCoding
     """
 
-    def __init__(self, in_features: int, out_features: int, lr_inference: float = 0.01):
+    def __init__(self):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.lr_inference = lr_inference
-        # Top-down: r (B, out_features) → prediction (B, in_features)
-        # weight.shape = (in_features, out_features)  [PyTorch: Linear(A,B).weight is (B,A)]
-        self.W = nn.Linear(out_features, in_features, bias=False)
-        # Mutable inference state — set per-batch by PCNetwork.init_states
-        self.r: torch.Tensor = None
-        self.e: torch.Tensor = None
-        self.prediction: torch.Tensor = None
+        self._x: nn.Parameter | None = None
+        self._energy: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Bottom-up init of r.  x: (B, in_features) → r_init: (B, out_features).
-        tanh bounds each layer to [-1,1] so representations don't explode through the chain."""
-        return torch.tanh(x @ self.W.weight)  # (B, in) @ (in, out) = (B, out)
+    def set_x(self, mu: torch.Tensor) -> None:
+        """Initialise latent state from bottom-up prediction (called before inference)."""
+        self._x = nn.Parameter(mu.detach().clone())
 
-    def predict(self) -> torch.Tensor:
-        return torch.tanh(self.W(self.r))  # (B, in_features)
+    @property
+    def x(self) -> nn.Parameter:
+        return self._x
 
-    def compute_error(self, r_below: torch.Tensor) -> torch.Tensor:
-        self.prediction = self.predict()
-        self.e = r_below - self.prediction
-        return self.e
+    def forward(self, mu: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            self._energy = 0.5 * (self._x - mu).pow(2).sum()
+            return self._x
+        return mu
 
-    def update_r(self, e_above: torch.Tensor = None) -> None:
-        """One inference step. e_above is the raw error from the layer directly above."""
-        dtanh = 1.0 - self.prediction ** 2               # Jacobian of tanh, (B, in_features)
-        bottom_up = (self.e * dtanh) @ self.W.weight      # (B, out_features)
-        delta = bottom_up if e_above is None else bottom_up + e_above
-        self.r = self.r + self.lr_inference * delta        # avoid in-place under no_grad
-
-    def update_weights(self, lr_weights: float = 0.001, weight_decay: float = 1e-3) -> None:
-        """Hebbian update — call only after inference has converged.
-        weight_decay keeps W bounded; without it Hebbian updates grow without limit."""
-        with torch.no_grad():
-            dW = (self.e.t() @ self.r) / self.e.shape[0]  # (in_features, out_features)
-            self.W.weight.add_(lr_weights * (dW - weight_decay * self.W.weight))
+    def energy(self) -> torch.Tensor:
+        return self._energy
 
     def __repr__(self) -> str:
-        return f"PCLayer(in={self.in_features}, out={self.out_features}, lr_i={self.lr_inference})"
+        shape = tuple(self._x.shape) if self._x is not None else "uninitialized"
+        return f"PCLayer(x_shape={shape})"
 
 
 class PCNetwork(nn.Module):
-    """Stack of PCLayers. Inference runs in-place; weights update only after inference."""
+    """Predictive coding network matching the Bogacz-Group reference.
 
-    def __init__(self, layer_dims: list, lr_inference: float = 0.01):
+    Architecture:
+        Linear(784 → H) → PCLayer → ReLU → Linear(H → H) → PCLayer → ReLU → Linear(H → 10)
+
+    Weights live in the nn.Linear modules.  PCLayers hold only latent states.
+    Inference: SGD on latent states (weights frozen).
+    Learning:  Adam on Linear weights, applied only at the last inference step.
+    """
+
+    def __init__(self, hidden_size: int = 256, output_size: int = 10,
+                 lr_inference: float = 0.01):
         super().__init__()
-        self.layers = nn.ModuleList([
-            PCLayer(layer_dims[i], layer_dims[i + 1], lr_inference)
-            for i in range(len(layer_dims) - 1)
-        ])
+        self.lr_inference = lr_inference
+        self.linear1 = nn.Linear(784, hidden_size)
+        self.pc1     = PCLayer()
+        self.act1    = nn.ReLU()
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.pc2     = PCLayer()
+        self.act2    = nn.ReLU()
+        self.linear3 = nn.Linear(hidden_size, output_size)
+        self.pc_layers = [self.pc1, self.pc2]
 
     def init_states(self, x: torch.Tensor) -> None:
-        """Bottom-up initialisation: feeds x through W.T at each layer.
-        Far better than zeros — inference converges in ~20 steps instead of 100+."""
-        r = x
-        for layer in self.layers:
-            r = layer.forward(r).detach()
-            layer.r = r
+        """Bottom-up forward pass to initialise latent states before inference."""
+        with torch.no_grad():
+            mu1 = self.linear1(x)
+            self.pc1.set_x(mu1)
+            a1  = self.act1(mu1)
+            mu2 = self.linear2(a1)
+            self.pc2.set_x(mu2)
 
-    @torch.no_grad()
-    def infer(self, x: torch.Tensor, n_steps: int = 20, clamp_top: torch.Tensor = None) -> None:
-        """Run inference loop.  clamp_top: one-hot labels (B, n_classes) for supervised training."""
-        for _ in range(n_steps):
-            if clamp_top is not None:
-                self.layers[-1].r = clamp_top
-
-            # Bottom-up error pass
-            self.layers[0].compute_error(x)
-            for i in range(1, len(self.layers)):
-                self.layers[i].compute_error(self.layers[i - 1].r)
-
-            # Top-down representation update
-            if clamp_top is None:
-                self.layers[-1].update_r()
-            for i in range(len(self.layers) - 2, -1, -1):
-                self.layers[i].update_r(e_above=-self.layers[i + 1].e)
-
-    def update_weights(self, lr_weights: float = 0.001) -> None:
-        """Hebbian weight update — call only after infer() has converged."""
-        for layer in self.layers:
-            layer.update_weights(lr_weights)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mu1 = self.linear1(x)
+        x1  = self.pc1(mu1)     # returns pc1._x during train, mu1 during eval
+        a1  = self.act1(x1)
+        mu2 = self.linear2(a1)
+        x2  = self.pc2(mu2)
+        a2  = self.act2(x2)
+        return self.linear3(a2)
 
     def total_energy(self) -> torch.Tensor:
-        return sum((layer.e ** 2).sum(dim=-1).mean() for layer in self.layers)
+        return sum(layer.energy() for layer in self.pc_layers)
+
+    def get_representation(self, x: torch.Tensor, layer_idx: int = 0) -> torch.Tensor:
+        """Extract intermediate representation via bottom-up pass (eval mode).
+
+        layer_idx=0: activations after pc1 (H-dim)
+        layer_idx=1: activations after pc2 (H-dim)
+        """
+        with torch.no_grad():
+            mu1 = self.linear1(x)
+            if layer_idx == 0:
+                return self.act1(mu1)
+            a1  = self.act1(mu1)
+            mu2 = self.linear2(a1)
+            if layer_idx == 1:
+                return self.act2(mu2)
+        raise ValueError(f"layer_idx must be 0 or 1, got {layer_idx}")
+
+    def infer(self, x: torch.Tensor, y_onehot: torch.Tensor = None,
+              n_steps: int = 20, return_energy: bool = False):
+        """Run inference (update latent states only, weights frozen).
+
+        y_onehot: one-hot labels — supervised inference.
+        None     — free inference (minimise PC energy only, no output loss).
+        return_energy: if True, return list of total energy recorded before each step.
+        """
+        was_training = self.training
+        self.train()
+        self.init_states(x)
+        optimizer_x = torch.optim.SGD(
+            [layer.x for layer in self.pc_layers], lr=self.lr_inference
+        )
+        loss_fn = lambda o, t: 0.5 * (o - t).pow(2).sum()
+        energies = []
+
+        for _ in range(n_steps):
+            optimizer_x.zero_grad()
+            output = self(x)
+            energy = self.total_energy()
+            total  = (loss_fn(output, y_onehot) + energy) if y_onehot is not None else energy
+            if return_energy:
+                energies.append(total.item())
+            total.backward()
+            optimizer_x.step()
+
+        if not was_training:
+            self.eval()
+        return energies if return_energy else None
